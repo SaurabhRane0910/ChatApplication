@@ -1,0 +1,395 @@
+﻿@page "/chat"
+@using Microsoft.AspNetCore.SignalR.Client
+@using Microsoft.AspNetCore.Components.Forms
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+@inject IWebHostEnvironment Env
+
+@if (!isUserSet)
+{
+    <div class="username-wrapper">
+        <input @bind="userInput" placeholder="Enter your name..." class="name-box" />
+        <button class="set-name-btn" @onclick="SetUser">Join Chat</button>
+    </div>
+}
+else
+{
+    <div class="chat-container">
+        <div class="chat-header">
+            <div class="chat-user">
+                <span class="chat-username">@userInput</span>
+                <span class="chat-status">
+                    @(hubConnection?.State == HubConnectionState.Connected ? "Online" : "Offline")
+                </span>
+            </div>
+        </div>
+
+        <div class="messages" id="messagesDiv">
+            @foreach (var msg in messages)
+            {
+                <div class="message @(msg.User == userInput ? "sent" : "received")">
+                    <div class="bubble">
+                        @if (msg.User != userInput)
+                        {
+                            <div class="sender-name">@msg.User</div> 
+                        }
+                        @if (msg.IsFile)
+                        {
+                            @if (msg.FileType.StartsWith("image"))
+                            {
+                                <img src="@msg.Text" class="msg-image" />
+                            }
+                            else
+                            {
+                                <a href="@msg.Text" target="_blank">📎 Download File</a>
+                            }
+                        }
+                        else
+                        {
+                            <div class="text">@msg.Text</div>
+                        }
+
+                        <div class="meta">
+                            <span class="time">@msg.Time</span>
+                            @if (msg.User == userInput)
+                            {
+                                <span class="ticks">
+                                    @if (msg.Status == "sent")
+                                    {
+                                        <span>✓</span>
+                                    }
+                                    else if (msg.Status == "delivered")
+                                    {
+                                        <span>✓✓</span>
+                                    }
+                                    else if (msg.Status == "seen")
+                                    {
+                                        <span style="color:dodgerblue;">✓✓</span>
+                                    }
+                                </span>
+                            }
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <div class="typing">@typingUser</div>
+
+        <div class="input-row">
+            <input @bind="messageInput"
+                   @oninput="OnTyping"
+                   @onkeypress="HandleKeyPress"
+                   placeholder="Type a message"
+                   class="input-box" />
+
+            <InputFile OnChange="UploadFile" class="file-input" />
+            <button class="send-btn" @onclick="Send">➤</button>
+        </div>
+    </div>
+}
+
+@code {
+    private HubConnection? hubConnection;
+    private string userInput = "";
+    private string messageInput = "";
+    private List<Message> messages = new();
+    private bool isUserSet = false;
+    private string typingUser = "";
+
+    private IBrowserFile? selectedFile; // store file until Send button pressed
+
+    protected override async Task OnInitializedAsync()
+    {
+        hubConnection = new HubConnectionBuilder()
+            .WithUrl(Navigation.ToAbsoluteUri("/chathub"))
+            .WithAutomaticReconnect()
+            .Build();
+
+        // ✅ Receive message
+        hubConnection.On<string, string, string, bool, string>(
+            "ReceiveMessage",
+            async (user, text, time, isFile, fileType) =>
+            {
+                messages.Add(new Message
+                    {
+                        User = user,
+                        Text = text,
+                        Time = time,
+                        Status = user == userInput ? "sent" : "delivered",
+                        IsFile = isFile,
+                        FileType = fileType
+                    });
+
+                await ScrollToBottom();
+                await InvokeAsync(StateHasChanged);
+            });
+
+        // ✅ Typing indicators
+        hubConnection.On<string>("UserTyping", async user =>
+        {
+            if (user != userInput)
+            {
+                typingUser = $"{user} is typing...";
+                await InvokeAsync(StateHasChanged);
+            }
+        });
+
+        hubConnection.On<string>("UserStoppedTyping", async user =>
+        {
+            if (typingUser.Contains(user))
+            {
+                typingUser = "";
+                await InvokeAsync(StateHasChanged);
+            }
+        });
+
+        await hubConnection.StartAsync();
+    }
+
+    private void SetUser()
+    {
+        if (!string.IsNullOrWhiteSpace(userInput))
+            isUserSet = true;
+    }
+
+    private async Task Send()
+    {
+        if (selectedFile != null)
+        {
+            var uploads = Path.Combine(Env.WebRootPath, "uploads");
+            if (!Directory.Exists(uploads)) Directory.CreateDirectory(uploads);
+
+            var filePath = Path.Combine(uploads, selectedFile.Name);
+            await using var fs = new FileStream(filePath, FileMode.Create);
+            await selectedFile.OpenReadStream().CopyToAsync(fs);
+
+            var fileUrl = $"{Navigation.BaseUri}uploads/{selectedFile.Name}";
+            await hubConnection!.InvokeAsync("SendMessage", userInput, fileUrl, true, selectedFile.ContentType);
+
+            selectedFile = null; // reset after sending
+        }
+        else if (!string.IsNullOrWhiteSpace(messageInput))
+        {
+            await hubConnection!.InvokeAsync("SendMessage", userInput, messageInput, false, "");
+            messageInput = string.Empty;
+        }
+
+        await ScrollToBottom();
+    }
+
+    private async Task HandleKeyPress(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await Send();
+    }
+
+    private async Task OnTyping(ChangeEventArgs e)
+    {
+        if (!string.IsNullOrEmpty(messageInput))
+            await hubConnection!.InvokeAsync("Typing", userInput);
+        else
+            await hubConnection!.InvokeAsync("StopTyping", userInput);
+    }
+
+    private async Task ScrollToBottom()
+    {
+        await JS.InvokeVoidAsync("scrollToBottom", "messagesDiv");
+    }
+
+    private Task UploadFile(InputFileChangeEventArgs e)
+    {
+        selectedFile = e.File; // wait until user clicks "Send"
+        return Task.CompletedTask;
+    }
+
+    public class Message
+    {
+        public string User { get; set; } = "";
+        public string Text { get; set; } = "";
+        public string Time { get; set; } = "";
+        public string Status { get; set; } = "sent";
+        public bool IsFile { get; set; } = false;
+        public string FileType { get; set; } = "";
+    }
+}
+
+<style>
+    .username-wrapper {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        height: 80vh;
+    }
+
+    .name-box {
+        padding: 10px;
+        width: 250px;
+        margin-bottom: 10px;
+        border-radius: 6px;
+        border: 1px solid #ddd;
+    }
+
+    .set-name-btn {
+        padding: 8px 16px;
+        border-radius: 6px;
+        border: none;
+        background: #075E54;
+        color: #fff;
+        cursor: pointer;
+    }
+
+    .chat-container {
+        display: flex;
+        flex-direction: column;
+        height: 80vh;
+        max-width: 500px;
+        margin: auto;
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        background: #ece5dd;
+    }
+
+    .messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .message {
+        display: flex;
+        margin: 5px 0;
+    }
+
+        .message.sent {
+            justify-content: flex-end;
+        }
+
+        .message.received {
+            justify-content: flex-start;
+        }
+
+    .bubble {
+        max-width: 70%;
+        padding: 8px 12px;
+        border-radius: 12px;
+        position: relative;
+        font-family: Arial, sans-serif;
+        background: #fff;
+        margin-bottom: 4px;
+    }
+
+    .message.sent .bubble {
+        background: #dcf8c6;
+        border-bottom-right-radius: 0;
+    }
+
+    .message.received .bubble {
+        background: #fff;
+        border-bottom-left-radius: 0;
+    }
+
+    .text {
+        margin-bottom: 4px;
+        word-wrap: break-word;
+    }
+
+    .meta {
+        font-size: 0.7rem;
+        color: #888;
+        text-align: right;
+    }
+
+    .ticks {
+        margin-left: 5px;
+    }
+
+    .typing {
+        padding: 5px 10px;
+        font-size: 0.8rem;
+        color: #555;
+        font-style: italic;
+    }
+
+    .input-row {
+        display: flex;
+        padding: 8px;
+        border-top: 1px solid #ddd;
+        background: #fff;
+        align-items: center;
+    }
+
+    .input-box {
+        flex: 1;
+        padding: 10px;
+        border: none;
+        border-radius: 20px;
+        outline: none;
+        font-size: 1rem;
+        background: #f0f0f0;
+    }
+
+    .file-input {
+        margin-left: 8px;
+    }
+
+    .send-btn {
+        margin-left: 8px;
+        border: none;
+        border-radius: 50%;
+        background: #075E54;
+        color: white;
+        width: 40px;
+        height: 40px;
+        cursor: pointer;
+        font-size: 1.2rem;
+    }
+
+        .send-btn:hover {
+            background: #128C7E;
+        }
+
+    .msg-image {
+        max-width: 200px;
+        border-radius: 6px;'
+        '
+        margin-bottom: 4px;
+    }
+
+    .sender-name {
+        font-size: 0.75rem;
+        font-weight: bold;
+        margin-bottom: 2px;
+        color: #075E54; /* WhatsApp green shade */
+    }
+
+
+    .chat-header {
+        display: flex;
+        align-items: center;
+        padding: 10px;
+        background: #075E54; /* WhatsApp green */
+        color: white;
+        border-top-left-radius: 10px;
+        border-top-right-radius: 10px;
+    }
+
+    .chat-user {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .chat-username {
+        font-weight: bold;
+        font-size: 1rem;
+    }
+
+    .chat-status {
+        font-size: 0.8rem;
+        color: #cfd9d7;
+    }
+
+
+</style>
